@@ -60,9 +60,35 @@ pub fn is_light_taskbar() -> bool {
     status == 0 && val_type == REG_DWORD && data != 0
 }
 
+pub fn format_pill_text(battery: Option<u8>, device_name: Option<&str>, show_name: bool) -> String {
+    match battery {
+        Some(pct) => {
+            if show_name
+                && let Some(name) = device_name
+                && !name.trim().is_empty()
+            {
+                let trimmed = name.trim();
+                let short = if trimmed.chars().count() > 22 {
+                    let prefix: String = trimmed.chars().take(21).collect();
+                    format!("{}…", prefix.trim_end())
+                } else {
+                    trimmed.to_string()
+                };
+                format!("{short} · {pct}%")
+            } else {
+                format!("{pct}%")
+            }
+        }
+        None => "--".to_string(),
+    }
+}
+
 pub fn render_pill(
     battery: Option<u8>,
     category: DeviceCategory,
+    device_name: Option<&str>,
+    show_name: bool,
+    show_bar: bool,
     light_taskbar: bool,
     hovered: bool,
     dpi: u32,
@@ -73,10 +99,8 @@ pub fn render_pill(
     let icon_sz = (15.0 * scale).round() as i32;
     let gap = (5.0 * scale).round() as i32;
 
-    let text = match battery {
-        Some(pct) => format!("{pct}%"),
-        None => "--".to_string(),
-    };
+    let text = format_pill_text(battery, device_name, show_name);
+    let has_bar = show_bar && battery.is_some();
 
     let fg = foreground_rgb(battery, light_taskbar);
     let (bg_rgb, bg_alpha) = if hovered {
@@ -98,11 +122,16 @@ pub fn render_pill(
     let hi_w = w * SS;
     let hi_h = h * SS;
 
+    let y_shift_hi = if has_bar {
+        (2.0 * scale * SS as f32).round() as i32
+    } else {
+        0
+    };
     let text_x_hi = (pad_x + icon_sz + gap) * SS;
-    let text_luma = rasterize_text_hi(&text, font_h_hi, hi_w, hi_h, text_x_hi);
+    let text_luma = rasterize_text_hi(&text, font_h_hi, hi_w, hi_h, text_x_hi, -2 - y_shift_hi);
 
     let icon_cx = (pad_x as f32 + icon_sz as f32 * 0.5) * SS as f32;
-    let icon_cy = (h as f32 * 0.5) * SS as f32;
+    let icon_cy = (h as f32 * 0.5) * SS as f32 - y_shift_hi as f32;
     let icon_s = icon_sz as f32 * SS as f32;
 
     let pill_cx = hi_w as f32 * 0.5;
@@ -110,6 +139,36 @@ pub fn render_pill(
     let pill_hx = pill_cx - 1.0 * SS as f32 * 0.25;
     let pill_hy = pill_cy - 1.0 * SS as f32;
     let pill_r = 5.5 * scale * SS as f32;
+
+    // Optional thin 2px iOS-style rounded-capsule battery bar at the bottom.
+    let bar_cy = (h as f32 - 4.0 * scale) * SS as f32;
+    let bar_hy = 1.0 * scale * SS as f32;
+    let bar_x0 = (pad_x as f32) * SS as f32;
+    let bar_x1 = ((w - pad_x) as f32) * SS as f32;
+    let bar_full_w = (bar_x1 - bar_x0).max(2.0 * bar_hy);
+    let bar_cx = (bar_x0 + bar_x1) * 0.5;
+    let bar_hx = bar_full_w * 0.5;
+    let pct = battery.unwrap_or(0);
+    let bar_fill_w = if pct == 0 {
+        0.0
+    } else {
+        (bar_full_w * (pct as f32 / 100.0))
+            .max(2.0 * bar_hy)
+            .min(bar_full_w)
+    };
+    let bar_fill_cx = bar_x0 + bar_fill_w * 0.5;
+    let bar_fill_hx = bar_fill_w * 0.5;
+    let bar_rgb = bar_accent_rgb(pct, light_taskbar);
+    let (bar_fr, bar_fg, bar_fb) = (
+        bar_rgb.0 as f32 / 255.0,
+        bar_rgb.1 as f32 / 255.0,
+        bar_rgb.2 as f32 / 255.0,
+    );
+    let (track_val, track_alpha) = if light_taskbar {
+        (0.0f32, 28.0 / 255.0)
+    } else {
+        (1.0f32, 38.0 / 255.0)
+    };
 
     let fg_r = fg.0 as f32 / 255.0;
     let fg_g = fg.1 as f32 / 255.0;
@@ -133,12 +192,51 @@ pub fn render_pill(
                     let hx = x * SS + sx;
                     let fx = hx as f32 + 0.5;
 
-                    let pill_cov =
-                        sdf_coverage(sd_round_box(fx - pill_cx, fy - pill_cy, pill_hx, pill_hy, pill_r));
-                    let ba = bg_alpha * pill_cov;
-                    let br = bg_rgb.0 * ba;
-                    let bg_ = bg_rgb.1 * ba;
-                    let bb = bg_rgb.2 * ba;
+                    let pill_cov = sdf_coverage(sd_round_box(
+                        fx - pill_cx,
+                        fy - pill_cy,
+                        pill_hx,
+                        pill_hy,
+                        pill_r,
+                    ));
+                    let mut dst_a = bg_alpha * pill_cov;
+                    let mut dst_r = bg_rgb.0 * dst_a;
+                    let mut dst_g = bg_rgb.1 * dst_a;
+                    let mut dst_b = bg_rgb.2 * dst_a;
+
+                    if has_bar {
+                        let track_cov = sdf_coverage(sd_round_box(
+                            fx - bar_cx,
+                            fy - bar_cy,
+                            bar_hx,
+                            bar_hy,
+                            bar_hy,
+                        ));
+                        if track_cov > 0.0 {
+                            let ta = track_alpha * track_cov;
+                            let inv_ta = 1.0 - ta;
+                            dst_r = track_val * ta + dst_r * inv_ta;
+                            dst_g = track_val * ta + dst_g * inv_ta;
+                            dst_b = track_val * ta + dst_b * inv_ta;
+                            dst_a = ta + dst_a * inv_ta;
+                        }
+                        if bar_fill_w > 0.0 {
+                            let fill_cov = sdf_coverage(sd_round_box(
+                                fx - bar_fill_cx,
+                                fy - bar_cy,
+                                bar_fill_hx,
+                                bar_hy,
+                                bar_hy,
+                            ));
+                            if fill_cov > 0.0 {
+                                let inv_fill = 1.0 - fill_cov;
+                                dst_r = bar_fr * fill_cov + dst_r * inv_fill;
+                                dst_g = bar_fg * fill_cov + dst_g * inv_fill;
+                                dst_b = bar_fb * fill_cov + dst_b * inv_fill;
+                                dst_a = fill_cov + dst_a * inv_fill;
+                            }
+                        }
+                    }
 
                     let icon_d = sdf_device_icon(category, fx - icon_cx, fy - icon_cy, icon_s);
                     let icon_cov = sdf_coverage(icon_d);
@@ -146,10 +244,10 @@ pub fn render_pill(
                     let fa = icon_cov.max(txt_cov).clamp(0.0, 1.0);
 
                     let inv_fa = 1.0 - fa;
-                    sum_r += fg_r * fa + br * inv_fa;
-                    sum_g += fg_g * fa + bg_ * inv_fa;
-                    sum_b += fg_b * fa + bb * inv_fa;
-                    sum_a += fa + ba * inv_fa;
+                    sum_r += fg_r * fa + dst_r * inv_fa;
+                    sum_g += fg_g * fa + dst_g * inv_fa;
+                    sum_b += fg_b * fa + dst_b * inv_fa;
+                    sum_a += fa + dst_a * inv_fa;
                 }
             }
 
@@ -295,6 +393,26 @@ fn foreground_rgb(battery: Option<u8>, light_taskbar: bool) -> (u8, u8, u8) {
     }
 }
 
+fn bar_accent_rgb(pct: u8, light_taskbar: bool) -> (u8, u8, u8) {
+    if pct <= 10 {
+        if light_taskbar {
+            (255, 59, 48)
+        } else {
+            (255, 69, 58)
+        }
+    } else if pct <= 20 {
+        if light_taskbar {
+            (217, 119, 6)
+        } else {
+            (255, 159, 10)
+        }
+    } else if light_taskbar {
+        (36, 138, 61)
+    } else {
+        (52, 199, 89)
+    }
+}
+
 fn create_minimal_font(font_h: i32) -> *mut std::ffi::c_void {
     let face: Vec<u16> = "Segoe UI Variable Text\0".encode_utf16().collect();
     unsafe {
@@ -344,7 +462,14 @@ fn measure_text_hi(text: &str, font_h_hi: i32) -> i32 {
     sz.cx.max(16)
 }
 
-fn rasterize_text_hi(text: &str, font_h_hi: i32, hi_w: i32, hi_h: i32, text_x_hi: i32) -> Vec<u8> {
+fn rasterize_text_hi(
+    text: &str,
+    font_h_hi: i32,
+    hi_w: i32,
+    hi_h: i32,
+    text_x_hi: i32,
+    y_offset_hi: i32,
+) -> Vec<u8> {
     let count = (hi_w * hi_h) as usize;
     let mut luma = vec![0u8; count];
 
@@ -403,9 +528,9 @@ fn rasterize_text_hi(text: &str, font_h_hi: i32, hi_w: i32, hi_h: i32, text_x_hi
 
     let mut rc = RECT {
         left: text_x_hi,
-        top: -2,
+        top: y_offset_hi,
         right: hi_w,
-        bottom: hi_h - 2,
+        bottom: hi_h + y_offset_hi,
     };
     let wide: Vec<u16> = text.encode_utf16().collect();
     unsafe {
@@ -477,7 +602,6 @@ fn sdf_device_icon(category: DeviceCategory, px: f32, py: f32, s: f32) -> f32 {
             let r = 0.34 * s;
             let ay = 0.03 * s;
             let stroke = 0.052 * s;
-            // Semicircle top headband with smooth vertical drops.
             let d_arc = if py <= ay {
                 (px.hypot(py - ay) - r).abs() - stroke
             } else {
@@ -485,7 +609,6 @@ fn sdf_device_icon(category: DeviceCategory, px: f32, py: f32, s: f32) -> f32 {
                 let d_r = sd_segment(px, py, r, ay, r, ay + 0.14 * s) - stroke;
                 d_l.min(d_r)
             };
-            // Sleek rounded capsule earcups.
             let cup_x = 0.31 * s;
             let cup_y = 0.17 * s;
             let d_cup_l = sd_round_box(px + cup_x, py - cup_y, 0.095 * s, 0.165 * s, 0.065 * s);
@@ -542,9 +665,8 @@ mod tests {
         assert_eq!(pill.pixels.len(), (pill.width * pill.height * 4) as usize);
 
         let mut visible_pixels = 0usize;
-        let mut left_half_visible = 0usize;
-        let mut right_half_visible = 0usize;
-        let half_x = pill.width / 2;
+        let mut icon_visible = 0usize;
+        let mut text_visible = 0usize;
 
         for y in 0..pill.height {
             for x in 0..pill.width {
@@ -555,34 +677,79 @@ mod tests {
                     pill.pixels[idx + 2],
                     pill.pixels[idx + 3],
                 );
-                // Premultiplied BGRA invariant must hold strictly.
                 assert!(b <= a && g <= a && r <= a);
                 if a > 30 {
                     visible_pixels += 1;
-                    if x < half_x {
-                        left_half_visible += 1;
+                    if x < 24 {
+                        icon_visible += 1;
                     } else {
-                        right_half_visible += 1;
+                        text_visible += 1;
                     }
                 }
             }
         }
 
         assert!(visible_pixels > 10);
-        assert!(left_half_visible > 5, "SDF icon region had no visible pixels");
-        assert!(right_half_visible > 5, "Typography region had no visible pixels");
+        assert!(icon_visible > 5, "SDF icon region had no visible pixels");
+        assert!(text_visible > 5, "Typography region had no visible pixels");
     }
 
     #[test]
-    fn renders_premultiplied_pills_across_categories_themes_and_dpi() {
+    fn formats_pill_text_with_optional_name_and_truncation() {
+        assert_eq!(format_pill_text(None, Some("Test"), true), "--");
+        assert_eq!(format_pill_text(Some(90), Some("Test"), false), "90%");
+        assert_eq!(
+            format_pill_text(Some(90), Some("SOUNDPEATS T3 Pro"), true),
+            "SOUNDPEATS T3 Pro · 90%"
+        );
+        let long = format_pill_text(Some(85), Some("Very Long Bluetooth Headset Name"), true);
+        assert!(long.contains("… · 85%"));
+    }
+
+    #[test]
+    fn renders_premultiplied_pills_with_optional_bar_and_name() {
+        let compact = render_pill(
+            Some(90),
+            DeviceCategory::Headset,
+            Some("SOUNDPEATS T3 Pro"),
+            false,
+            false,
+            true,
+            false,
+            96,
+        );
+        assert_valid_pill(&compact);
+
+        let named_with_bar = render_pill(
+            Some(90),
+            DeviceCategory::Headset,
+            Some("SOUNDPEATS T3 Pro"),
+            true,
+            true,
+            true,
+            false,
+            96,
+        );
+        assert_valid_pill(&named_with_bar);
+        assert!(named_with_bar.width > compact.width);
+
+        // Verify bottom battery bar pixels exist along y = height - 4.
+        let bar_y = named_with_bar.height - 4;
+        let bar_pixels = (8..named_with_bar.width - 8)
+            .filter(|&x| {
+                let idx = ((bar_y * named_with_bar.width + x) * 4) as usize;
+                named_with_bar.pixels[idx + 3] > 200
+            })
+            .count();
+        assert!(bar_pixels > 10, "Expected visible battery bar pixels");
+
         for (bat, cat, light, hovered, dpi) in [
-            (Some(90), DeviceCategory::Headset, true, false, 96),
             (Some(100), DeviceCategory::Mouse, false, true, 144),
-            (Some(15), DeviceCategory::Keyboard, true, false, 96),
+            (Some(15), DeviceCategory::Keyboard, true, true, 96),
             (Some(8), DeviceCategory::Gamepad, false, false, 96),
             (None, DeviceCategory::Bluetooth, true, false, 96),
         ] {
-            let pill = render_pill(bat, cat, light, hovered, dpi);
+            let pill = render_pill(bat, cat, Some("Dev"), false, true, light, hovered, dpi);
             assert_valid_pill(&pill);
         }
     }

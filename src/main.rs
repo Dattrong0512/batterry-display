@@ -4,10 +4,12 @@
 mod autostart;
 mod devices;
 mod render;
+mod settings;
 mod tray;
 
 use devices::{DeviceBattery, DeviceCategory, scan_devices, select_active_device};
 use render::RenderedPill;
+use settings::Settings;
 use tray::{MenuAction, format_tooltip, show_context_menu};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
@@ -64,6 +66,9 @@ impl Drop for MutexGuard {
 struct RenderKey {
     battery: Option<u8>,
     category: DeviceCategory,
+    device_name: Option<String>,
+    show_name: bool,
+    show_bar: bool,
     light_taskbar: bool,
     hovered: bool,
     dpi: u32,
@@ -75,7 +80,7 @@ struct AppState {
     hinstance: HINSTANCE,
     taskbar_created_msg: u32,
     devices: Vec<DeviceBattery>,
-    pinned_id: Option<String>,
+    settings: Settings,
     hovered: bool,
     dpi: u32,
     pos_x: i32,
@@ -96,7 +101,7 @@ impl AppState {
             hinstance,
             taskbar_created_msg,
             devices: Vec::new(),
-            pinned_id: None,
+            settings: Settings::load(),
             hovered: false,
             dpi,
             pos_x: 0,
@@ -108,22 +113,22 @@ impl AppState {
         }
     }
 
+    fn active_device(&self) -> Option<&DeviceBattery> {
+        select_active_device(&self.devices, self.settings.selected_device.as_deref())
+    }
+
     fn refresh(&mut self, force_redraw: bool) {
         self.devices = scan_devices();
-        if let Some(pinned) = &self.pinned_id
-            && !self.devices.iter().any(|d| d.container_id == *pinned)
-        {
-            self.pinned_id = None;
-        }
         self.update_visuals(force_redraw);
         self.sync_position(true);
     }
 
     fn update_visuals(&mut self, force_redraw: bool) {
-        let active = select_active_device(&self.devices, self.pinned_id.as_deref());
+        let active = self.active_device();
         let active_id = active.map(|d| d.container_id.as_str());
         let battery = active.map(|d| d.battery);
         let category = active.map(|d| d.category).unwrap_or(DeviceCategory::Headset);
+        let device_name = active.map(|d| d.name.clone());
         let light = render::is_light_taskbar();
         let tip = format_tooltip(&self.devices, active_id);
 
@@ -135,6 +140,13 @@ impl AppState {
         let key = RenderKey {
             battery,
             category,
+            device_name: if self.settings.show_device_name {
+                device_name.clone()
+            } else {
+                None
+            },
+            show_name: self.settings.show_device_name,
+            show_bar: self.settings.show_battery_bar,
             light_taskbar: light,
             hovered: self.hovered,
             dpi: self.dpi,
@@ -143,7 +155,16 @@ impl AppState {
             return;
         }
 
-        let pill = render::render_pill(battery, category, light, self.hovered, self.dpi);
+        let pill = render::render_pill(
+            battery,
+            category,
+            device_name.as_deref(),
+            self.settings.show_device_name,
+            self.settings.show_battery_bar,
+            light,
+            self.hovered,
+            self.dpi,
+        );
         self.pill = Some(pill);
         self.last_render = Some(key);
         if self.visible
@@ -219,13 +240,13 @@ impl AppState {
             self.refresh(true);
             return;
         }
-        let current_id = select_active_device(&self.devices, self.pinned_id.as_deref())
-            .map(|d| d.container_id.as_str());
+        let current_id = self.active_device().map(|d| d.container_id.as_str());
         let next_idx = current_id
             .and_then(|id| self.devices.iter().position(|d| d.container_id == id))
             .map(|i| (i + 1) % self.devices.len())
             .unwrap_or(0);
-        self.pinned_id = Some(self.devices[next_idx].container_id.clone());
+        self.settings.selected_device = Some(self.devices[next_idx].container_id.clone());
+        self.settings.save();
         self.update_visuals(true);
         self.sync_position(true);
     }
@@ -499,20 +520,31 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_RBUTTONUP | WM_CONTEXTMENU => {
+            let active_id = state.active_device().map(|d| d.container_id.clone());
             let action = show_context_menu(
                 hwnd,
                 &state.devices,
-                state.pinned_id.as_deref(),
+                active_id.as_deref(),
+                state.settings.show_battery_bar,
+                state.settings.show_device_name,
                 autostart::is_enabled(),
             );
             match action {
-                MenuAction::SelectAuto => {
-                    state.pinned_id = None;
+                MenuAction::SelectDevice(id) => {
+                    state.settings.selected_device = Some(id);
+                    state.settings.save();
                     state.update_visuals(true);
                     state.sync_position(true);
                 }
-                MenuAction::SelectDevice(id) => {
-                    state.pinned_id = Some(id);
+                MenuAction::ToggleBatteryBar => {
+                    state.settings.show_battery_bar = !state.settings.show_battery_bar;
+                    state.settings.save();
+                    state.update_visuals(true);
+                    state.sync_position(true);
+                }
+                MenuAction::ToggleDeviceName => {
+                    state.settings.show_device_name = !state.settings.show_device_name;
+                    state.settings.save();
                     state.update_visuals(true);
                     state.sync_position(true);
                 }

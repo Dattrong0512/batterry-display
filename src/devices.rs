@@ -133,14 +133,14 @@ pub fn scan_devices() -> Vec<DeviceBattery> {
 
 pub fn select_active_device<'a>(
     devices: &'a [DeviceBattery],
-    pinned_id: Option<&str>,
+    selected_id: Option<&str>,
 ) -> Option<&'a DeviceBattery> {
-    if let Some(id) = pinned_id
+    if let Some(id) = selected_id
         && let Some(found) = devices.iter().find(|d| d.container_id == id)
     {
         return Some(found);
     }
-    devices.iter().min_by_key(|d| d.battery)
+    devices.first()
 }
 
 fn enumerate_by_prefix(enumerator: Enumerator, out: &mut Vec<RawDeviceNode>) {
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_multiple_device_types_and_selects_lowest_battery() {
+    fn aggregates_multiple_device_types_and_selects_preferred_or_first() {
         let headset_cid = [1; 16];
         let mut mouse_node = node(
             "BTHLE\\Dev_AABBCCDDEEFF\\7&1",
@@ -637,12 +637,12 @@ mod tests {
         assert_eq!(devs[2].name, "Sony WH-1000XM5");
         assert_eq!(devs[2].category, DeviceCategory::Headset);
 
-        // Auto mode picks lowest battery (MX Master 3S at 28%)
-        let auto_pick = select_active_device(&devs, None).unwrap();
-        assert_eq!(auto_pick.name, "MX Master 3S");
+        // Unselected falls back to the first connected device (no lowest-battery override)
+        let default_pick = select_active_device(&devs, None).unwrap();
+        assert_eq!(default_pick.name, "Keychron K2");
 
-        // Pinned mode keeps pinned device
-        let pinned_pick = select_active_device(&devs, Some(&devs[2].container_id)).unwrap();
-        assert_eq!(pinned_pick.name, "Sony WH-1000XM5");
+        // Selected device ID keeps user choice
+        let chosen_pick = select_active_device(&devs, Some(&devs[2].container_id)).unwrap();
+        assert_eq!(chosen_pick.name, "Sony WH-1000XM5");
     }
 }

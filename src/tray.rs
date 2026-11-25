@@ -8,16 +8,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_NULL,
 };
 
-const IDM_AUTO: u32 = 1000;
 const IDM_REFRESH: u32 = 1001;
 const IDM_AUTOSTART: u32 = 1002;
 const IDM_EXIT: u32 = 1003;
+const IDM_SHOW_BAR: u32 = 1004;
+const IDM_SHOW_NAME: u32 = 1005;
 const IDM_DEVICE_BASE: u32 = 2000;
 
 pub enum MenuAction {
     None,
-    SelectAuto,
     SelectDevice(String),
+    ToggleBatteryBar,
+    ToggleDeviceName,
     Refresh,
     ToggleAutostart,
     Exit,
@@ -63,7 +65,9 @@ pub fn format_tooltip(devices: &[DeviceBattery], active_id: Option<&str>) -> Str
 pub fn show_context_menu(
     hwnd: HWND,
     devices: &[DeviceBattery],
-    pinned_id: Option<&str>,
+    active_id: Option<&str>,
+    show_bar: bool,
+    show_name: bool,
     autostart_enabled: bool,
 ) -> MenuAction {
     let hmenu: HMENU = unsafe { CreatePopupMenu() };
@@ -80,37 +84,37 @@ pub fn show_context_menu(
         );
     } else {
         for (i, dev) in devices.iter().enumerate() {
-            let checked = pinned_id == Some(dev.container_id.as_str());
+            let checked = active_id == Some(dev.container_id.as_str());
             let flag = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
             let label = format!("[{}] {} — {}%", dev.category.label(), dev.name, dev.battery);
             append_item(hmenu, flag, IDM_DEVICE_BASE as usize + i, &label);
         }
-        append_item(hmenu, MF_SEPARATOR, 0, "");
-        let auto_flag = MF_STRING
-            | if pinned_id.is_none() {
-                MF_CHECKED
-            } else {
-                MF_UNCHECKED
-            };
-        append_item(
-            hmenu,
-            auto_flag,
-            IDM_AUTO as usize,
-            "Tự động (ưu tiên pin thấp nhất)",
-        );
     }
 
     append_item(hmenu, MF_SEPARATOR, 0, "");
-    append_item(hmenu, MF_STRING, IDM_REFRESH as usize, "Cập nhật ngay");
-    let auto_start_flag = MF_STRING
-        | if autostart_enabled {
-            MF_CHECKED
-        } else {
-            MF_UNCHECKED
-        };
     append_item(
         hmenu,
-        auto_start_flag,
+        MF_STRING | if show_bar { MF_CHECKED } else { MF_UNCHECKED },
+        IDM_SHOW_BAR as usize,
+        "Hiện thanh pin",
+    );
+    append_item(
+        hmenu,
+        MF_STRING | if show_name { MF_CHECKED } else { MF_UNCHECKED },
+        IDM_SHOW_NAME as usize,
+        "Hiện tên thiết bị",
+    );
+
+    append_item(hmenu, MF_SEPARATOR, 0, "");
+    append_item(hmenu, MF_STRING, IDM_REFRESH as usize, "Cập nhật ngay");
+    append_item(
+        hmenu,
+        MF_STRING
+            | if autostart_enabled {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            },
         IDM_AUTOSTART as usize,
         "Khởi động cùng Windows",
     );
@@ -139,8 +143,10 @@ pub fn show_context_menu(
     }
 
     let cmd = cmd as u32;
-    if cmd == IDM_AUTO {
-        MenuAction::SelectAuto
+    if cmd == IDM_SHOW_BAR {
+        MenuAction::ToggleBatteryBar
+    } else if cmd == IDM_SHOW_NAME {
+        MenuAction::ToggleDeviceName
     } else if cmd == IDM_REFRESH {
         MenuAction::Refresh
     } else if cmd == IDM_AUTOSTART {

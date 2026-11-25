@@ -1,6 +1,6 @@
 [package]
 name = "batterry-display"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Ultra-lightweight Windows system tray utility displaying battery percentages for connected Bluetooth and wireless devices."
 license = "MIT"

@@ -21,7 +21,7 @@
 - **Tương tác trực tiếp trên Taskbar**:
   - **Di chuột (hover)**: Hiện nền pill mờ + tooltip % pin của tất cả thiết bị đang kết nối.
   - **Click chuột trái**: Chuyển nhanh qua thiết bị tiếp theo để hiển thị trên Taskbar.
-  - **Click chuột phải**: Ghim cố định 1 thiết bị hoặc để chế độ **Tự động (ưu tiên pin thấp nhất)**, bật/tắt **Khởi động cùng Windows**, làm mới thủ công, hoặc thoát ứng dụng.
+  - **Click chuột phải**: Chọn trực tiếp thiết bị muốn hiển thị (tự ghi nhớ vào cấu hình), bật/tắt **Hiện thanh pin**, bật/tắt **Hiện tên thiết bị**, bật/tắt **Khởi động cùng Windows**, làm mới thủ công, hoặc thoát ứng dụng.
 
 ---
 
