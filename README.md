@@ -1,6 +1,6 @@
 # BatteryDevice
 
-Ứng dụng Windows siêu nhẹ viết bằng **Rust** (thuần Win32 API, không framework nặng), hiển thị trực tiếp **% pin của tai nghe, chuột, bàn phím, tay cầm và các thiết bị Bluetooth/HID đang kết nối** ngay tại **System Tray** góc phải thanh Taskbar.
+Ứng dụng Windows siêu nhẹ viết bằng **Rust** (thuần Win32 API, không framework nặng), hiển thị tối giản **icon thiết bị + % pin** (`🎧 90%`, `🖱 85%`, `⌨ 60%`) trực tiếp ngay trên **thanh Taskbar** cạnh khay hệ thống.
 
 ---
 
@@ -8,19 +8,19 @@
 
 1. Vào trang [**Releases**](https://github.com/Dattrong0512/batterry-display/releases/latest) và tải file **`BatteryDevice.exe`**.
 2. Chạy trực tiếp `BatteryDevice.exe` (tự động link tĩnh CRT — **không cần cài Visual C++ Redistributable hay .NET**).
-3. **Hiển thị trực tiếp trên Taskbar (Windows 11)**: Khi chạy lần đầu, ứng dụng tự động ghim icon ra ngoài thanh Taskbar (nếu cần bật/tắt lại thủ công, vào *Taskbar settings* → *Other system tray icons* → **BatteryDevice**).
+3. Widget trong suốt tự động neo ngay bên cạnh mũi tên khay hệ thống trên Taskbar Windows 10/11 và tự ẩn khi có ứng dụng toàn màn hình.
 
 ---
 
 ## Tính năng chính
 
+- **Phong cách tối giản kiểu iPhone**: Vẽ vector icon từng loại thiết bị (tai nghe, chuột, bàn phím, tay cầm, Bluetooth) và font `Segoe UI Variable Text` Medium bằng **4x supersampling**, đơn sắc tinh gọn (tự chuyển cam/đỏ khi pin `<= 20%`).
 - **Nhận diện đa thiết bị tự động**: Hỗ trợ Bluetooth Classic (tai nghe HFP), Bluetooth LE / GATT Battery Service (chuột, bàn phím, tai nghe BLE, bút cảm ứng) và thiết bị HID không dây có báo pin qua Windows PnP.
-- **Siêu nhẹ & không tốn tài nguyên**: Dung lượng file `.exe` chỉ khoảng vài trăm KB, tiêu thụ ~1.5–3 MB RAM, ~0% CPU khi chạy nền (event-driven Win32 loop).
-- **Cập nhật tức thì**: Tự lắng nghe `WM_DEVICECHANGE` (phản hồi ~1s khi bật/tắt thiết bị) kết hợp làm mới định kỳ mỗi 15 giây.
-- **Tự thích ứng giao diện & DPI**: Đọc `SystemUsesLightTheme` và `SM_CXSMICON` để vẽ chữ sắc nét trên cả Taskbar sáng/tối và màn hình độ phân giải cao.
-- **Quản lý nhiều thiết bị tiện lợi**:
-  - Di chuột (hover) lên icon để xem % pin của tất cả thiết bị đang kết nối.
-  - **Click chuột trái**: Chuyển nhanh qua thiết bị tiếp theo để hiển thị số % lên icon.
+- **Siêu nhẹ & không tốn tài nguyên**: Dung lượng file `.exe` chỉ ~270 KB, tiêu thụ ~1.5–3 MB private RAM, ~0% CPU khi chạy nền (event-driven Win32 loop).
+- **Cập nhật tức thì & thích ứng nền**: Lắng nghe `WM_DEVICECHANGE` (phản hồi ~1s khi bật/tắt thiết bị), tự đổi màu theo Dark/Light Taskbar và DPI màn hình.
+- **Tương tác trực tiếp trên Taskbar**:
+  - **Di chuột (hover)**: Hiện nền pill mờ + tooltip % pin của tất cả thiết bị đang kết nối.
+  - **Click chuột trái**: Chuyển nhanh qua thiết bị tiếp theo để hiển thị trên Taskbar.
   - **Click chuột phải**: Ghim cố định 1 thiết bị hoặc để chế độ **Tự động (ưu tiên pin thấp nhất)**, bật/tắt **Khởi động cùng Windows**, làm mới thủ công, hoặc thoát ứng dụng.
 
 ---

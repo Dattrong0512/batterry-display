@@ -1,36 +1,54 @@
-// Rust (windows-sys 0.59), Windows 10/11 headless tray app entry & message loop.
+// Rust (windows-sys 0.59), Apple/iOS minimal taskbar pill window & message loop.
 #![windows_subsystem = "windows"]
 
 mod autostart;
 mod devices;
-mod icon;
+mod render;
 mod tray;
 
-use devices::{DeviceBattery, scan_devices, select_active_device};
-use tray::{MenuAction, TrayIcon, WM_TRAYICON, format_tooltip, show_context_menu};
+use devices::{DeviceBattery, DeviceCategory, scan_devices, select_active_device};
+use render::RenderedPill;
+use tray::{MenuAction, format_tooltip, show_context_menu};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    RECT, WPARAM,
 };
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Controls::{
+    TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
+};
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
+    SetProcessDpiAwarenessContext,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
+use windows_sys::Win32::UI::Shell::{
+    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DBT_DEVNODES_CHANGED, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer,
-    SetWindowLongPtrW, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DEVICECHANGE, WM_LBUTTONUP,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    FindWindowExW, FindWindowW, GW_HWNDPREV, GWLP_USERDATA, GetMessageW, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer,
+    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SendMessageW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DESTROY, WM_DEVICECHANGE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const TIMER_POLL_ID: usize = 1;
 const TIMER_DEBOUNCE_ID: usize = 2;
-const TIMER_PROMOTE_ID: usize = 3;
+const TIMER_SYNC_ID: usize = 3;
+
 const POLL_INTERVAL_MS: u32 = 15_000;
 const DEBOUNCE_DELAY_MS: u32 = 1_000;
-const PROMOTE_RETRY_MS: u32 = 600;
+const SYNC_INTERVAL_MS: u32 = 750;
 
 struct MutexGuard(HANDLE);
 
@@ -45,26 +63,48 @@ impl Drop for MutexGuard {
 #[derive(PartialEq, Eq)]
 struct RenderKey {
     battery: Option<u8>,
-    tooltip: String,
+    category: DeviceCategory,
     light_taskbar: bool,
+    hovered: bool,
+    dpi: u32,
 }
 
 struct AppState {
-    tray: TrayIcon,
+    hwnd: HWND,
+    tooltip_hwnd: HWND,
+    hinstance: HINSTANCE,
     taskbar_created_msg: u32,
     devices: Vec<DeviceBattery>,
     pinned_id: Option<String>,
+    hovered: bool,
+    dpi: u32,
+    pos_x: i32,
+    pos_y: i32,
+    visible: bool,
     last_render: Option<RenderKey>,
+    last_tooltip: String,
+    pill: Option<RenderedPill>,
 }
 
 impl AppState {
-    fn new(hwnd: HWND, taskbar_created_msg: u32) -> Self {
+    fn new(hwnd: HWND, hinstance: HINSTANCE, taskbar_created_msg: u32) -> Self {
+        let tooltip_hwnd = create_tooltip_window(hwnd, hinstance);
+        let dpi = unsafe { GetDpiForSystem() }.max(96);
         Self {
-            tray: TrayIcon::new(hwnd),
+            hwnd,
+            tooltip_hwnd,
+            hinstance,
             taskbar_created_msg,
             devices: Vec::new(),
             pinned_id: None,
+            hovered: false,
+            dpi,
+            pos_x: 0,
+            pos_y: 0,
+            visible: false,
             last_render: None,
+            last_tooltip: String::new(),
+            pill: None,
         }
     }
 
@@ -75,28 +115,103 @@ impl AppState {
         {
             self.pinned_id = None;
         }
-        self.render(force_redraw);
+        self.update_visuals(force_redraw);
+        self.sync_position(true);
     }
 
-    fn render(&mut self, force_redraw: bool) {
+    fn update_visuals(&mut self, force_redraw: bool) {
         let active = select_active_device(&self.devices, self.pinned_id.as_deref());
         let active_id = active.map(|d| d.container_id.as_str());
-        let active_battery = active.map(|d| d.battery);
-        let tooltip = format_tooltip(&self.devices, active_id);
-        let light = icon::is_light_taskbar();
+        let battery = active.map(|d| d.battery);
+        let category = active.map(|d| d.category).unwrap_or(DeviceCategory::Headset);
+        let light = render::is_light_taskbar();
+        let tip = format_tooltip(&self.devices, active_id);
+
+        if tip != self.last_tooltip {
+            update_tooltip_text(self.tooltip_hwnd, self.hwnd, self.hinstance, &tip);
+            self.last_tooltip = tip;
+        }
 
         let key = RenderKey {
-            battery: active_battery,
-            tooltip: tooltip.clone(),
+            battery,
+            category,
             light_taskbar: light,
+            hovered: self.hovered,
+            dpi: self.dpi,
         };
         if !force_redraw && self.last_render.as_ref() == Some(&key) {
             return;
         }
 
-        let hicon = icon::create_battery_icon(active_battery, light);
-        self.tray.update(hicon, &tooltip);
+        let pill = render::render_pill(battery, category, light, self.hovered, self.dpi);
+        self.pill = Some(pill);
         self.last_render = Some(key);
+        if self.visible
+            && let Some(p) = &self.pill
+        {
+            render::apply_to_layered_window(self.hwnd, self.pos_x, self.pos_y, p);
+        }
+    }
+
+    fn sync_position(&mut self, force_apply: bool) {
+        let Some((tray_hwnd, tray_rc, tray_dpi, anchor_right)) = find_taskbar_geometry() else {
+            self.hide();
+            return;
+        };
+        if is_fullscreen_active() {
+            self.hide();
+            return;
+        }
+
+        if tray_dpi != self.dpi {
+            self.dpi = tray_dpi;
+            self.update_visuals(true);
+        }
+        let Some(pill) = &self.pill else {
+            return;
+        };
+
+        let x = anchor_right - pill.width;
+        let y = tray_rc.top + ((tray_rc.bottom - tray_rc.top) - pill.height) / 2;
+
+        let changed = !self.visible || self.pos_x != x || self.pos_y != y;
+        self.pos_x = x;
+        self.pos_y = y;
+
+        if changed || force_apply {
+            render::apply_to_layered_window(self.hwnd, x, y, pill);
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    pill.width,
+                    pill.height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            self.visible = true;
+        } else if !is_window_above(self.hwnd, tray_hwnd) {
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    fn hide(&mut self) {
+        if self.visible {
+            unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+            self.visible = false;
+        }
     }
 
     fn cycle_device(&mut self) {
@@ -111,7 +226,132 @@ impl AppState {
             .map(|i| (i + 1) % self.devices.len())
             .unwrap_or(0);
         self.pinned_id = Some(self.devices[next_idx].container_id.clone());
-        self.render(true);
+        self.update_visuals(true);
+        self.sync_position(true);
+    }
+}
+
+fn is_window_above(target: HWND, reference: HWND) -> bool {
+    let mut cur = unsafe { GetWindow(reference, GW_HWNDPREV) };
+    let mut steps = 0usize;
+    while !cur.is_null() && steps < 64 {
+        if cur == target {
+            return true;
+        }
+        cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
+        steps += 1;
+    }
+    false
+}
+
+fn find_taskbar_geometry() -> Option<(HWND, RECT, u32, i32)> {
+    let tray_cls: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+    let tray_hwnd = unsafe { FindWindowW(tray_cls.as_ptr(), std::ptr::null()) };
+    if tray_hwnd.is_null() || unsafe { IsWindowVisible(tray_hwnd) } == 0 {
+        return None;
+    }
+
+    let mut tray_rc: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(tray_hwnd, &mut tray_rc) } == 0 {
+        return None;
+    }
+    if tray_rc.bottom - tray_rc.top < 20 || tray_rc.right - tray_rc.left < 120 {
+        return None;
+    }
+
+    let dpi = unsafe { GetDpiForWindow(tray_hwnd) }.max(96);
+    let scale = dpi as f32 / 96.0;
+    let gap = (2.0 * scale).round() as i32;
+
+    let notify_cls: Vec<u16> = "TrayNotifyWnd\0".encode_utf16().collect();
+    let notify_hwnd = unsafe {
+        FindWindowExW(
+            tray_hwnd,
+            std::ptr::null_mut(),
+            notify_cls.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+
+    let mut anchor_right = tray_rc.right - (220.0 * scale).round() as i32;
+    if !notify_hwnd.is_null() {
+        let mut notify_rc: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(notify_hwnd, &mut notify_rc) } != 0
+            && notify_rc.left > tray_rc.left + 80
+            && notify_rc.right <= tray_rc.right + 4
+        {
+            anchor_right = notify_rc.left - gap;
+        }
+    }
+
+    Some((tray_hwnd, tray_rc, dpi, anchor_right))
+}
+
+fn is_fullscreen_active() -> bool {
+    let mut state = 0i32;
+    let hr = unsafe { SHQueryUserNotificationState(&mut state) };
+    hr >= 0
+        && (state == QUNS_BUSY
+            || state == QUNS_RUNNING_D3D_FULL_SCREEN
+            || state == QUNS_PRESENTATION_MODE)
+}
+
+fn create_tooltip_window(owner_hwnd: HWND, hinstance: HINSTANCE) -> HWND {
+    let tip_hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST,
+            TOOLTIPS_CLASSW,
+            std::ptr::null(),
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            0,
+            0,
+            0,
+            0,
+            owner_hwnd,
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        )
+    };
+    if tip_hwnd.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let mut empty = [0u16; 1];
+    let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
+    ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = owner_hwnd;
+    ti.uId = owner_hwnd as usize;
+    ti.hinst = hinstance;
+    ti.lpszText = empty.as_mut_ptr();
+
+    unsafe {
+        SendMessageW(tip_hwnd, TTM_ADDTOOLW, 0, (&ti as *const TTTOOLINFOW) as isize);
+        SendMessageW(tip_hwnd, TTM_SETMAXTIPWIDTH, 0, 360);
+    }
+    tip_hwnd
+}
+
+fn update_tooltip_text(tip_hwnd: HWND, owner_hwnd: HWND, hinstance: HINSTANCE, text: &str) {
+    if tip_hwnd.is_null() {
+        return;
+    }
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
+    ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+    ti.hwnd = owner_hwnd;
+    ti.uId = owner_hwnd as usize;
+    ti.hinst = hinstance;
+    ti.lpszText = wide.as_mut_ptr();
+
+    unsafe {
+        SendMessageW(
+            tip_hwnd,
+            TTM_UPDATETIPTEXTW,
+            0,
+            (&ti as *const TTTOOLINFOW) as isize,
+        );
     }
 }
 
@@ -172,18 +412,16 @@ fn main() {
         return;
     }
 
-    // Must be a hidden top-level window (not HWND_MESSAGE) to receive WM_SETTINGCHANGE,
-    // WM_DEVICECHANGE, and TaskbarCreated broadcasts.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             class_name.as_ptr(),
             class_name.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            WS_POPUP,
             0,
             0,
-            0,
-            0,
+            1,
+            1,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -194,14 +432,12 @@ fn main() {
         return;
     }
 
-    let state_ptr = Box::into_raw(Box::new(AppState::new(hwnd, taskbar_created_msg)));
+    let state_ptr = Box::into_raw(Box::new(AppState::new(hwnd, hinstance, taskbar_created_msg)));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         (*state_ptr).refresh(true);
-        if !tray::promote_to_taskbar_if_unset() {
-            SetTimer(hwnd, TIMER_PROMOTE_ID, PROMOTE_RETRY_MS, None);
-        }
         SetTimer(hwnd, TIMER_POLL_ID, POLL_INTERVAL_MS, None);
+        SetTimer(hwnd, TIMER_SYNC_ID, SYNC_INTERVAL_MS, None);
     }
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -212,7 +448,6 @@ fn main() {
         }
     }
 
-    // Reclaim Box<AppState> only after message loop terminates.
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         drop(Box::from_raw(state_ptr));
@@ -232,45 +467,65 @@ unsafe extern "system" fn wnd_proc(
     let state = unsafe { &mut *state_ptr };
 
     if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
-        let active_id = select_active_device(&state.devices, state.pinned_id.as_deref())
-            .map(|d| d.container_id.as_str());
-        let tip = format_tooltip(&state.devices, active_id);
-        state.tray.readd(&tip);
+        state.update_visuals(true);
+        state.sync_position(true);
         return 0;
     }
 
     match msg {
-        WM_TRAYICON => {
-            let ev = (lparam & 0xFFFF) as u32;
-            if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU {
-                let action = show_context_menu(
-                    hwnd,
-                    &state.devices,
-                    state.pinned_id.as_deref(),
-                    autostart::is_enabled(),
-                );
-                match action {
-                    MenuAction::SelectAuto => {
-                        state.pinned_id = None;
-                        state.render(true);
-                    }
-                    MenuAction::SelectDevice(id) => {
-                        state.pinned_id = Some(id);
-                        state.render(true);
-                    }
-                    MenuAction::Refresh => {
-                        state.refresh(true);
-                    }
-                    MenuAction::ToggleAutostart => {
-                        let _ = autostart::set_enabled(!autostart::is_enabled());
-                    }
-                    MenuAction::Exit => {
-                        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
-                    }
-                    MenuAction::None => {}
+        WM_MOUSEMOVE => {
+            if !state.hovered {
+                state.hovered = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe { TrackMouseEvent(&mut tme) };
+                state.update_visuals(false);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            if state.hovered {
+                state.hovered = false;
+                state.update_visuals(false);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            state.cycle_device();
+            0
+        }
+        WM_RBUTTONUP | WM_CONTEXTMENU => {
+            let action = show_context_menu(
+                hwnd,
+                &state.devices,
+                state.pinned_id.as_deref(),
+                autostart::is_enabled(),
+            );
+            match action {
+                MenuAction::SelectAuto => {
+                    state.pinned_id = None;
+                    state.update_visuals(true);
+                    state.sync_position(true);
                 }
-            } else if ev == WM_LBUTTONUP {
-                state.cycle_device();
+                MenuAction::SelectDevice(id) => {
+                    state.pinned_id = Some(id);
+                    state.update_visuals(true);
+                    state.sync_position(true);
+                }
+                MenuAction::Refresh => {
+                    state.refresh(true);
+                }
+                MenuAction::ToggleAutostart => {
+                    let _ = autostart::set_enabled(!autostart::is_enabled());
+                }
+                MenuAction::Exit => {
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                MenuAction::None => {}
             }
             0
         }
@@ -280,9 +535,8 @@ unsafe extern "system" fn wnd_proc(
             } else if wparam == TIMER_DEBOUNCE_ID {
                 unsafe { KillTimer(hwnd, TIMER_DEBOUNCE_ID) };
                 state.refresh(false);
-            } else if wparam == TIMER_PROMOTE_ID {
-                unsafe { KillTimer(hwnd, TIMER_PROMOTE_ID) };
-                let _ = tray::promote_to_taskbar_if_unset();
+            } else if wparam == TIMER_SYNC_ID {
+                state.sync_position(false);
             }
             0
         }
@@ -293,7 +547,8 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_SETTINGCHANGE => {
-            state.render(false);
+            state.update_visuals(false);
+            state.sync_position(false);
             0
         }
         WM_CLOSE => {
@@ -304,9 +559,12 @@ unsafe extern "system" fn wnd_proc(
             unsafe {
                 KillTimer(hwnd, TIMER_POLL_ID);
                 KillTimer(hwnd, TIMER_DEBOUNCE_ID);
-                KillTimer(hwnd, TIMER_PROMOTE_ID);
+                KillTimer(hwnd, TIMER_SYNC_ID);
+                if !state.tooltip_hwnd.is_null() {
+                    DestroyWindow(state.tooltip_hwnd);
+                    state.tooltip_hwnd = std::ptr::null_mut();
+                }
             }
-            state.tray.remove();
             unsafe { PostQuitMessage(0) };
             0
         }
